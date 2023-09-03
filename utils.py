@@ -26,3 +26,27 @@ def soft_update(target, source, tau):
 def hard_update(target, source):
     for target_param, param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_(param.data)
+
+def soft_ensemble_update(target_list, source_list, tau, ensemble):
+    for i in range(ensemble):
+        for target_param, param in zip(target_list[i].parameters(), source_list[i].parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+def hard_ensemble_update(target_list, source_list, ensemble):
+    for i in range(ensemble):
+        for target_param, param in zip(target_list[i].parameters(), source_list[i].parameters()):
+            target_param.data.copy_(param.data)
+
+def evaluate_policy(env, agent, max_episode_steps):
+    state = env.reset()
+    episode_reward = 0.
+    i = 1
+    done = False
+    while not done or i <= max_episode_steps:
+        action = agent.select_action(state, evaluate=True)
+        next_state, reward, done, _ = env.step(action)
+        episode_reward += reward
+        state = next_state
+        i = i + 1
+    
+    return episode_reward

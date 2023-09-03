@@ -59,6 +59,25 @@ class QNetwork(nn.Module):
         x2 = self.linear6(x2)
 
         return x1, x2
+    
+class MLP(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_dim):
+        super(MLP, self).__init__()
+
+        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+
+        self.apply(weights_init_)
+
+    def forward(self, state, action):
+        xu = torch.cat([state, action], 1)
+        
+        x1 = F.relu(self.linear1(xu))
+        x1 = F.relu(self.linear2(x1))
+        x1 = self.linear3(x1)
+
+        return x1
 
 
 class GaussianPolicy(nn.Module):
