@@ -2,21 +2,36 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-from utils import soft_ensemble_update, hard_ensemble_update
+from utils import soft_update, hard_update
 from model import GaussianPolicy, MLP, DeterministicPolicy
-
 
 class SAC_N(object):
     def __init__(self, num_inputs, action_space, args):
 
+        self.quantile = args.quantile
         self.ensemble = args.ensemble
         self.gamma = args.gamma
         self.tau = args.tau
         self.alpha = args.alpha
 
-        self.policy_type = args.policy
+        self.policy_type = args.agent_policy
         self.target_update_interval = args.target_update_interval
         self.automatic_entropy_tuning = args.automatic_entropy_tuning
+
+        def min_value(input):
+            return torch.min(input, 1).values
+        def quantile_value(input):
+            return torch.quantile(input, q=args.quantile, dim=1)
+        def mean_minus_std_value(input):
+            return torch.mean(input, dim=1) - args.scale * torch.std(input, dim=1)
+        if args.policy == "BENCH":
+            self.value_fun = min_value
+        elif args.policy == "MM" or args.policy == "PM":
+            self.value_fun = quantile_value
+        elif args.policy == "PB":
+            self.value_fun = mean_minus_std_value
+        else:
+            pass
 
         self.device = torch.device("cuda" if args.cuda else "cpu")
 
@@ -24,7 +39,7 @@ class SAC_N(object):
         self.critic_optim = [Adam(single_critic.parameters(), lr=args.lr) for single_critic in self.critic]
 
         self.critic_target = [MLP(num_inputs, action_space.shape[0], args.hidden_size).to(device=self.device) for _ in range(self.ensemble)]
-        hard_ensemble_update(self.critic_target, self.critic)
+        [hard_update(self.critic_target[i], self.critic[i]) for i in range(self.ensemble)]
 
         if self.policy_type == "Gaussian":
             # Target Entropy = −dim(A) (e.g. , -6 for HalfCheetah-v2) as given in the paper
@@ -42,33 +57,37 @@ class SAC_N(object):
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        state = state.unsqueeze(0)
         if evaluate is False:
             action, _, _ = self.policy.sample(state)
         else:
             _, _, action = self.policy.sample(state)
         return action.detach().cpu().numpy()[0]
 
-    def update_parameters(self, updates, state_batch, action_batch, reward_batch, next_state_batch, mask_batch):
+    def update_parameters(self, updates, observations, actions, rewards, next_observations, terminals):
+        # print("rewards: ", rewards.shape)
         # update critics:
         with torch.no_grad():
-            next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
-            qf_next_target = torch.tensor([one_critic_target(next_state_batch, next_state_action) for one_critic_target in self.critic_target])
-            min_qf_next_target = torch.min(qf_next_target, 0).values - self.alpha * next_state_log_pi
-            next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
-        
+            next_state_action, next_state_log_pi, _ = self.policy.sample(next_observations)
+            # print("next_state_action: ", next_state_action.shape)
+            qf_next_target = torch.cat([one_critic_target(next_observations, next_state_action) for one_critic_target in self.critic_target], 1)
+            # print("qf_next_target: ", qf_next_target.shape)
+            min_qf_next_target = torch.min(qf_next_target, 1).values - self.alpha * torch.flatten(next_state_log_pi)
+            # print("min_qf_next_target: ", min_qf_next_target.shape)
+            next_q_value = rewards + (1 - terminals.int()) * self.gamma * (min_qf_next_target)
+            # print("next_q_value", next_q_value.shape)
+
         for i in range(self.ensemble):
-            # Two Q-functions to mitigate positive bias in the policy improvement step
-            qf = self.critic[i](state_batch, action_batch)
-            qf_loss = F.mse_loss(qf, next_q_value)  
+            qf_i = torch.flatten(self.critic[i](observations, actions))
+            qf_i_loss = F.mse_loss(qf_i, next_q_value)  
             self.critic_optim[i].zero_grad()
-            qf_loss.backward()
+            qf_i_loss.backward()
             self.critic_optim[i].step()
 
         # update actor:
-        pi, log_pi, _ = self.policy.sample(state_batch)
-        qf = torch.tensor([one_critic(state_batch, pi) for one_critic in self.critic])
-        min_qf_pi = torch.min(qf, 0).values
+        pi, log_pi, _ = self.policy.sample(observations)
+        qf = torch.cat([one_critic(observations, pi) for one_critic in self.critic], 1)
+        min_qf_pi = torch.min(qf, 1).values
 
         policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
         self.policy_optim.zero_grad()
@@ -87,7 +106,44 @@ class SAC_N(object):
 
         # update critic target:
         if updates % self.target_update_interval == 0:
-            soft_ensemble_update(self.critic_target, self.critic, self.tau)
+            [soft_update(self.critic_target[i], self.critic[i], self.tau) for i in range(self.ensemble)]
+
+    def update_critic_i_parameters(self, i, updates, observations, actions, rewards, next_observations, terminals):
+        with torch.no_grad():
+            next_state_action, next_state_log_pi, _ = self.policy.sample(next_observations)
+            qf_next_target = torch.cat([one_critic_target(next_observations, next_state_action) for one_critic_target in self.critic_target], 1)
+            qf_next_target = self.value_fun(qf_next_target) - self.alpha * torch.flatten(next_state_log_pi)
+            next_q_value = rewards + (1 - terminals.int()) * self.gamma * (qf_next_target)
+
+        qf_i = torch.flatten(self.critic[i](observations, actions))
+        qf_i_loss = F.mse_loss(qf_i, next_q_value)  
+        self.critic_optim[i].zero_grad()
+        qf_i_loss.backward()
+        self.critic_optim[i].step()
+        
+        # update critic target:
+        if updates % self.target_update_interval == 0:
+            soft_update(self.critic_target[i], self.critic[i], self.tau)
+
+    def update_actor_parameters(self, observations, actions, rewards, next_observations, terminals):
+        pi, log_pi, _ = self.policy.sample(observations)
+        qf = torch.cat([one_critic(observations, pi) for one_critic in self.critic], 1)
+        qf_pi = self.value_fun(qf)
+
+        policy_loss = ((self.alpha * log_pi) - qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+        self.policy_optim.zero_grad()
+        policy_loss.backward()
+        self.policy_optim.step()
+
+        # update temperature:
+        if self.automatic_entropy_tuning:
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            self.alpha_optim.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optim.step()
+            self.alpha = self.log_alpha.exp()
+        else:
+            alpha_loss = torch.tensor(0.).to(self.device)
 
     # Save model parameters
     def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
@@ -121,4 +177,3 @@ class SAC_N(object):
                 self.policy.train()
                 self.critic.train()
                 self.critic_target.train()
-

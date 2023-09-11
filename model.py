@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,13 +7,13 @@ from torch.distributions import Normal
 LOG_SIG_MAX = 2
 LOG_SIG_MIN = -20
 epsilon = 1e-6
+DEFAULT_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Initialize Policy weights
 def weights_init_(m):
     if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight, gain=1)
-        torch.nn.init.constant_(m.bias, 0)
-
+        nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+        nn.init.constant_(m.bias, 0.1)
 
 class ValueNetwork(nn.Module):
     def __init__(self, num_inputs, hidden_dim):
@@ -66,6 +67,7 @@ class MLP(nn.Module):
 
         self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear21 = nn.Linear(hidden_dim, hidden_dim)
         self.linear3 = nn.Linear(hidden_dim, 1)
 
         self.apply(weights_init_)
@@ -75,10 +77,10 @@ class MLP(nn.Module):
         
         x1 = F.relu(self.linear1(xu))
         x1 = F.relu(self.linear2(x1))
+        x1 = F.relu(self.linear21(x1))
         x1 = self.linear3(x1)
 
         return x1
-
 
 class GaussianPolicy(nn.Module):
     def __init__(self, num_inputs, num_actions, hidden_dim, action_space=None):
@@ -86,6 +88,7 @@ class GaussianPolicy(nn.Module):
         
         self.linear1 = nn.Linear(num_inputs, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, hidden_dim)
 
         self.mean_linear = nn.Linear(hidden_dim, num_actions)
         self.log_std_linear = nn.Linear(hidden_dim, num_actions)
@@ -105,6 +108,7 @@ class GaussianPolicy(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
+        x = F.relu(self.linear3(x))
         mean = self.mean_linear(x)
         log_std = self.log_std_linear(x)
         log_std = torch.clamp(log_std, min=LOG_SIG_MIN, max=LOG_SIG_MAX)
@@ -154,7 +158,7 @@ class DeterministicPolicy(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        mean = torch.tanh(self.mean(x)) * self.action_scale + self.action_bias
+        mean = torch.tanh(self.mean(x)) * self.action_scale.to(DEFAULT_DEVICE) + self.action_bias.to(DEFAULT_DEVICE)
         return mean
 
     def sample(self, state):

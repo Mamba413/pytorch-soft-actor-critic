@@ -118,20 +118,8 @@ def evaluate_policy(env, policy, max_episode_steps, deterministic=True):
     total_reward = 0.
     for _ in range(max_episode_steps):
         with torch.no_grad():
-            action = policy.act(torchify(obs), deterministic=deterministic).cpu().numpy()
-        # Heuristic approach
-        # if type(policy) == list:
-        #     action_arr = []
-        #     for one_policy in policy:
-        #         with torch.no_grad():
-        #             action = one_policy.act(torchify(obs), deterministic=deterministic).cpu().numpy() 
-        #             action_arr.append(action)
-        #     action_arr = np.vstack(action_arr)
-        #     action = np.median(action_arr, axis=0).reshape(1, -1)
-        # else:
-        #     with torch.no_grad():
-        #         action = policy.act(torchify(obs), deterministic=deterministic).cpu().numpy()
-        next_obs, reward, done, info = env.step(action)
+            action = policy.select_action(torchify(obs), evaluate=deterministic)
+        next_obs, reward, done, _ = env.step(action)
         total_reward += reward
         if done:
             break
